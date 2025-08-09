@@ -1,4 +1,4 @@
-set-executionpolicy -scope Process -ExecutionPolicy bypass
+# set-executionpolicy -scope Process -ExecutionPolicy bypass
 
 $ipListFile = "ip_list.txt"
 
