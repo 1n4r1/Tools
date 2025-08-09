@@ -1,21 +1,23 @@
-param (
-    [string]$HostListPath = "hosts.txt"
-)
+set-executionpolicy -scope Process -ExecutionPolicy bypass
 
-if (-Not (Test-Path $HostListPath)) {
-    Write-Error "ホスト一覧ファイルが見つかりません: $HostListPath"
+$ipListFile = "ip_list.txt"
+
+if (-Not (Test-Path $ipListFile)) {
+    Write-Error "File '$ipListFile' is not found"
     exit 1
 }
 
-$hosts = Get-Content $HostListPath
-
-foreach ($host in $hosts) {
-    if (-not [string]::IsNullOrWhiteSpace($host)) {
-        Write-Host "`n=== $host の共有一覧 ===" -ForegroundColor Cyan
+Get-Content $ipListFile | ForEach-Object {
+    $ip = $_.Trim()
+    if ($ip) {
+        Write-Warning "===== list of $ip ====="
+        Write-Host "===== list of $ip ====="
         try {
-            net view \\$host
-        } catch {
-            Write-Warning "$host に接続できませんでした。"
+            net view "\\$ip"
         }
+        catch {
+            Write-Warning "couldn't connect to $ip "
+        }
+        Write-Host ""
     }
 }
