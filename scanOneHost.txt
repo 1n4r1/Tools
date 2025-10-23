@@ -1,0 +1,151 @@
+<#
+.SYNOPSIS
+  Single-host TCP port scanner (PowerShell 5.1, Start-Job ベースの並列版)
+.DESCRIPTION
+  - PowerShell 5.1 向け。Start-Job を使いポートごとにジョブを作成して並列実行します。
+  - Throttle で同時ジョブ数を制御。ジョブ開始後はジョブが完了するまで待たずに次を起動し、
+    同時ジョブ数が Throttle を超えないように調整します。
+  - 各ジョブはタイムアウトで接続を判定し、簡易バナー取得を試みます。
+  - Start-Job は別プロセスで動くため若干のオーバーヘッドがあり、非常に小さなポート数向けには
+    逆に遅くなる場合があります。Throttle は環境に合わせて調整してください。
+.PARAMETER Target
+  Hostname or IP (必須)
+.PARAMETER Ports
+  "1-1024,80,443" のような指定。デフォルトは主要ポート列。
+.PARAMETER TimeoutMs
+  TCP connect timeout (ミリ秒)。デフォルト 500。
+.PARAMETER Throttle
+  同時ジョブ数。デフォルト 100。マシン/ネットワークに合わせて下げてください。
+.PARAMETER OutCsv
+  結果を保存する CSV パス（オプション）。
+.EXAMPLE
+  powershell.exe -File .\portscan_ps51.ps1 -Target 192.168.1.10 -Ports "22,80,443,8000-8010" -Throttle 150 -TimeoutMs 400 -OutCsv scan.csv
+#>
+
+param(
+    [Parameter(Mandatory=$true)][string]$Target,
+    [string]$Ports = "21,22,23,25,53,80,110,139,143,443,445,3389,5900,8080",
+    [int]$TimeoutMs = 500,
+    [int]$Throttle = 100,
+    [string]$OutCsv
+)
+
+function Parse-Ports {
+    param([string]$spec)
+    $list = New-Object System.Collections.Generic.List[int]
+    foreach ($part in ($spec -split '\s*,\s*')) {
+        if ($part -match '^\d+-\d+$') {
+            $s,$e = $part -split '-'
+            for ($p = [int]$s; $p -le [int]$e; $p++) { $list.Add($p) }
+        } elseif ($part -match '^\d+$') {
+            $list.Add([int]$part)
+        } elseif ($part -eq '') { continue }
+        else { Write-Warning "Unknown port token: $part" }
+    }
+    return ($list | Sort-Object -Unique)
+}
+
+# parse
+$portArray = Parse-Ports -spec $Ports
+if ($portArray.Count -eq 0) { Write-Error "No ports parsed from: $Ports"; exit 1 }
+
+# helper: create job scriptblock (runs in child process)
+$jobBlock = {
+    param($target,$port,$timeout)
+    $obj = [PSCustomObject]@{
+        Target = $target
+        Port   = $port
+        Open   = $false
+        LatencyMs = $null
+        Service = ""
+        Error = $null
+    }
+    try {
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $tcp = New-Object System.Net.Sockets.TcpClient
+
+        # non-blocking connect pattern
+        $iar = $tcp.BeginConnect($target, $port, $null, $null)
+        $ok = $iar.AsyncWaitHandle.WaitOne($timeout)
+        if ($ok -and $tcp.Connected) {
+            $tcp.EndConnect($iar)
+            $sw.Stop()
+            $obj.Open = $true
+            $obj.LatencyMs = $sw.ElapsedMilliseconds
+            # banner grab (短時間でタイムアウト)
+            try {
+                $stream = $tcp.GetStream()
+                if ($stream.CanRead) {
+                    $stream.ReadTimeout = 300
+                    $buf = New-Object byte[] 1024
+                    $count = $stream.Read($buf,0,$buf.Length) 2>$null
+                    if ($count -gt 0) {
+                        $obj.Service = ([System.Text.Encoding]::ASCII.GetString($buf,0,$count)).Trim()
+                    }
+                }
+            } catch {}
+        } else {
+            # timeout or not connected
+        }
+        $tcp.Close()
+    } catch {
+        $obj.Error = $_.ToString()
+    }
+    return $obj
+}
+
+# start jobs with throttle control
+$jobs = @()
+$total = $portArray.Count
+$started = 0
+foreach ($p in $portArray) {
+    # throttle: wait while active running jobs >= Throttle
+    while ( (Get-Job -State Running).Count -ge $Throttle ) {
+        Start-Sleep -Milliseconds 100
+    }
+    $j = Start-Job -ScriptBlock $jobBlock -ArgumentList $Target, $p, $TimeoutMs
+    $jobs += $j
+    $started++
+    # progress display
+    $pct = [int](($started / $total) * 100)
+    Write-Progress -Activity "Starting jobs" -Status "Started $started / $total" -PercentComplete $pct
+}
+
+# all jobs started — wait for completion while showing progress
+Write-Progress -Activity "Waiting for scan to finish" -Status "Waiting for jobs..." -PercentComplete 0
+while ( (Get-Job -State Running).Count -gt 0 ) {
+    $running = (Get-Job -State Running).Count
+    $completed = (Get-Job).Count - $running
+    $pct = [int](($completed / $total) * 100)
+    Write-Progress -Activity "Waiting for scan to finish" -Status "Completed $completed / $total (Running: $running)" -PercentComplete $pct
+    Start-Sleep -Milliseconds 200
+}
+Write-Progress -Activity "Waiting for scan to finish" -Completed
+
+# collect results
+$results = @()
+foreach ($j in $jobs) {
+    $out = Receive-Job -Job $j -ErrorAction SilentlyContinue
+    if ($null -ne $out) { $results += $out }
+    Remove-Job -Job $j -Force -ErrorAction SilentlyContinue
+}
+
+# sort & display
+$results = $results | Sort-Object Port
+$open = $results | Where-Object { $_.Open } | Sort-Object Port
+
+if ($open.Count -eq 0) {
+    Write-Host "No open ports found on ${Target} (scanned $($portArray.Count) ports)."
+} else {
+    Write-Host "Open ports on ${Target}:"
+    $open | Format-Table Port,LatencyMs,Service -AutoSize
+}
+
+if ($OutCsv) {
+    try {
+        $results | Sort-Object Port | Export-Csv -Path $OutCsv -NoTypeInformation -Encoding UTF8
+        Write-Host "Saved results to $OutCsv"
+    } catch {
+        Write-Warning "Failed to save CSV: $($_.Exception.Message)"
+    }
+}
